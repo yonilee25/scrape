@@ -1,0 +1,36 @@
+  api:
+    build: ../apps/api
+    env_file: ../.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+    depends_on: [postgres, redis, minio, qdrant]
+    ports: ["8000:8000"]
+    profiles: ["core"]
+    volumes:
+      - ../apps:/app/apps
+      - ../libs:/app/libs
+    working_dir: /app
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  worker:
+    build: ../apps/worker
+    env_file: ../.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+    depends_on: [postgres, redis, minio, qdrant]
+    profiles: ["core", "ai", "discovery"]
+    volumes:
+      - ../apps:/app/apps
+      - ../libs:/app/libs
+    working_dir: /app
+    # Enable GPU if available
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    # Or simpler if your Docker supports it:
+    # gpus: all
+    command: ["celery", "-A", "apps.worker.worker", "worker", "--loglevel=INFO"]

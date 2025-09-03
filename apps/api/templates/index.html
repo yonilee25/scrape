@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% block content %}
+  <form action="/start" method="post" class="card">
+    <label>Person's name</label><br/>
+    <input type="text" name="person" style="width: 100%; margin-top: 0.5rem;" placeholder="e.g., Jane Q. Researcher" required />
+    <div style="margin-top: 0.75rem;">
+      <button type="submit">Start research</button>
+    </div>
+    <p class="muted" style="margin-top:0.5rem;">This will run locally: discovery → fetch → normalize → index → analyze.</p>
+  </form>
+{% endblock %}

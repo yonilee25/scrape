@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+{% block content %}
+  <div class="card">
+    <h2>Job: {{ job.id }}</h2>
+    <div>Target person: <strong>{{ job.person }}</strong></div>
+    <div>Status:
+      <span
+        hx-get="/fragments/jobs/{{ job.id }}/status"
+        hx-trigger="load, every 2s"
+        hx-swap="outerHTML"
+        class="badge">checking...</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Sources</h3>
+      <div hx-get="/fragments/jobs/{{ job.id }}/sources"
+           hx-trigger="load, every 5s"
+           hx-swap="innerHTML">Loading…</div>
+    </div>
+
+    <div class="card">
+      <h3>Timeline</h3>
+      <div hx-get="/fragments/jobs/{{ job.id }}/timeline"
+           hx-trigger="load, every 6s"
+           hx-swap="innerHTML">Loading…</div>
+    </div>
+  </div>
+{% endblock %}

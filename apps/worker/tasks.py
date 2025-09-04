@@ -38,22 +38,33 @@ def run_discovery(job_id: str, req: dict):
 
     # Provider 1: SearXNG (optional, if running)
     try:
-        items.extend(searxng_provider.discover(person, max_results=min(settings.DISCOVERY_MAX_RESULTS, 15)))
-    except Exception:
-        pass
+        searx_items = searxng_provider.discover(person, max_results=min(settings.DISCOVERY_MAX_RESULTS, 15))
+        print(f"[DEBUG] SearXNG returned {len(searx_items)} items for {person}", flush=True)
+        items.extend(searx_items)
+    except Exception as e:
+        print(f"[DEBUG] SearXNG provider failed: {e}", flush=True)
 
-    # Provider 2: Sitemaps (demo) — try some common domains; you can pass your own later.
-    demo_domains = ["medium.com", "substack.com", "wordpress.com"]
+    # Provider 2: Sitemaps (demo)
+    demo_domains = ["medium.com", "substack.com", "wordpress.com"]  
     try:
-        items.extend(sitemap_provider.discover(person, domains=demo_domains, max_results=10))
-    except Exception:
-        pass
+        site_items = sitemap_provider.discover(person, domains=demo_domains, max_results=10)
+        print(f"[DEBUG] Sitemap returned {len(site_items)} items for {person}", flush=True)
+        items.extend(site_items)
+    except Exception as e:
+        print(f"[DEBUG] Sitemap provider failed: {e}", flush=True)
 
-    # Provider 3: WordPress JSON (demo) — same demo domains
+    # Provider 3: WordPress JSON (demo)
     try:
-        items.extend(wordpress_provider.discover(person, domains=demo_domains, max_results=10))
-    except Exception:
-        pass
+        wp_items = wordpress_provider.discover(person, domains=demo_domains, max_results=10)
+        print(f"[DEBUG] WordPress returned {len(wp_items)} items for {person}", flush=True)
+        items.extend(wp_items)
+    except Exception as e:
+        print(f"[DEBUG] WordPress provider failed: {e}", flush=True)
+    
+
+    print(f"[DEBUG] run_discovery for {person} ({job_id}) got {len(items)} raw items", flush=True)
+    for i, it in enumerate(items[:5]):
+        print(f"[DEBUG] Raw item {i}: url={it.url}, kind={it.kind}, source={it.source}, title={it.title}", flush=True)
 
     # Deduplicate by URL
     seen = set()
@@ -64,14 +75,20 @@ def run_discovery(job_id: str, req: dict):
         seen.add(it.url)
         unique.append(it)
 
+    print(f"[DEBUG] run_discovery unique items: {len(unique)}", flush=True)
+
     # Store and enqueue fetch
     with get_session() as db:
         for it in unique:
+            print(f"[DEBUG] Inserting Source for job {job_id}: {it.url}", flush=True)
             s = Source(job_id=job_id, url=it.url, kind=it.kind, source=it.source, title=it.title,
                        published_at=it.published_at, confidence=it.confidence, status="queued")
             db.add(s)
             db.flush()  # to get s.id
+            print(f"[DEBUG] Enqueued fetch_source for source_id={s.id}", flush=True)
             fetch_source.delay(job_id, s.id, it.dict())
+
+    print(f"[DEBUG] Updating job {job_id} status to 'fetching'", flush=True)
     _set_status(job_id, "fetching")
 
 @celery_app.task
@@ -81,6 +98,7 @@ def fetch_source(job_id: str, source_id: int, item: dict):
     # Respect robots.txt
     if not robots_allows(url):
         with get_session() as db:
+            print(f"[DEBUG] Blocking fetch due to robots.txt for job {job_id}: {url}", flush=True)
             s = db.query(Source).get(source_id)
             if s:
                 s.status = "blocked_by_robots"

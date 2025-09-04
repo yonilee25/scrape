@@ -1,0 +1,28 @@
+server:
+  secret_key: "changeme"
+  base_url: http://searxng:8080/
+  search_on_http: true
+
+search:
+  safe_search: 0
+  autocomplete: "duckduckgo"
+
+doi_resolvers:
+  oadoi.org: 'https://oadoi.org/'
+  doi.org:   'https://doi.org/'
+  doai.io:   'https://dissem.in/'
+
+default_doi_resolver: 'oadoi.org'  
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+
+  - name: mojeek
+    engine: mojeek
+    shortcut: mjk

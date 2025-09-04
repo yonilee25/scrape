@@ -15,3 +15,6 @@ qdrant-client==1.9
 faster-whisper==1.0
 torch==2.3.1
 torchaudio==2.3.1
+requests==2.32.3
+trafilatura==1.9.0
+pypdf==4.2.0

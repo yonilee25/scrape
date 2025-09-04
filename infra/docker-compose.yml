@@ -1,3 +1,40 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes:
+      - pg:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    profiles: ["core"]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    profiles: ["core"]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin12345
+    volumes:
+      - minio:/data
+    ports: ["9000:9000", "9001:9001"]
+    profiles: ["core"]
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant:/qdrant/storage
+    ports: ["6333:6333"]
+    profiles: ["core"]
+
   api:
     build: ../apps/api
     env_file: ../.env
@@ -7,10 +44,10 @@
     depends_on: [postgres, redis, minio, qdrant]
     ports: ["8000:8000"]
     profiles: ["core"]
+    working_dir: /app
     volumes:
       - ../apps:/app/apps
       - ../libs:/app/libs
-    working_dir: /app
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   worker:
@@ -18,19 +55,44 @@
     env_file: ../.env
     environment:
       PYTHONUNBUFFERED: "1"
-      PYTHONPATH: /app
+      PYTHONPATH: /app/apps:/app/libs
     depends_on: [postgres, redis, minio, qdrant]
     profiles: ["core", "ai", "discovery"]
+    working_dir: /app
     volumes:
       - ../apps:/app/apps
       - ../libs:/app/libs
-    working_dir: /app
-    # Enable GPU if available
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: ["gpu"]
-    # Or simpler if your Docker supports it:
+    # Or if supported:
     # gpus: all
     command: ["celery", "-A", "apps.worker.worker", "worker", "--loglevel=INFO"]
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    ports: ["11434:11434"]
+    gpus: all
+    profiles: ["ai"]
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      - BASE_URL=http://localhost:8080/
+    ports: ["8080:8080"]
+    profiles: ["discovery"]
+
+  rsshub:
+    image: diygod/rsshub:latest
+    ports: ["1200:1200"]
+    profiles: ["discovery"]
+
+volumes:
+  pg: {}
+  minio: {}
+  qdrant: {}
+  ollama: {}

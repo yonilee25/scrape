@@ -10,3 +10,8 @@ redis==5.0.4
 celery==5.3.6
 minio==7.2.7
 qdrant-client==1.9
+
+# Missing package
+requests==2.32.3
+trafilatura==1.9.0
+pypdf==4.2.0

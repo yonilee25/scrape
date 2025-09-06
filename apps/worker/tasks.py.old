@@ -8,7 +8,6 @@ import traceback
 from datetime import datetime
 
 import requests
-from sqlalchemy import func
 
 from apps.worker.worker import celery_app
 from libs.common.config import Settings
@@ -27,55 +26,20 @@ SKIP_WORDPRESS = os.getenv("SKIP_WORDPRESS", "1") == "1"
 
 settings = Settings()
 
+
 def _set_status(job_id: str, status: str) -> None:
     """Update job status with a timestamp."""
     with get_session() as db:
-        job = db.get(Job, job_id)   
+        job = db.query(Job).get(job_id)
         if job:
             job.status = status
             job.updated_at = datetime.utcnow()
             db.add(job)
 
+
 def _hash_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def _pending_docs_count(job_id: str) -> int:
-    """How many docs are not yet terminal (indexed / index_failed / normalize_failed)."""
-    with get_session() as db:
-        return (
-            db.query(func.count(Document.id))
-            .filter(
-                Document.job_id == job_id,
-                Document.status.notin_(["indexed", "index_failed", "normalize_failed"]),
-            )
-            .scalar()
-            or 0
-        )
-
-#def _maybe_trigger_analysis(job_id: str) -> None:
-#    """If there are no pending docs, kick off analysis."""
-#    if _pending_docs_count(job_id) == 0:
-#        analyze_timeline.delay(job_id)
-
-def _maybe_trigger_analysis(job_id: str) -> None:
-    """Run analysis only when we actually have docs and none are pending."""
-    with get_session() as db:
-        total = db.query(func.count(Document.id)).filter(Document.job_id == job_id).scalar() or 0
-        if total == 0:
-            return  # don't analyze with zero docs
-
-        pending = db.query(func.count(Document.id)).filter(
-            Document.job_id == job_id,
-            Document.status.notin_(["indexed", "index_failed", "normalize_failed"])
-        ).scalar() or 0
-        if pending != 0:
-            return  # still work to do
-
-        job = db.get(Job, job_id)
-        if job and job.status in ("analyzing", "complete", "analysis_failed"):
-            return  # avoid duplicates
-
-    analyze_timeline.delay(job_id)
 
 # ---------------------------- DISCOVERY ----------------------------
 
@@ -142,7 +106,6 @@ def run_discovery(job_id: str, req: dict):
     print(f"[DEBUG] run_discovery unique items: {len(unique)}", flush=True)
 
     # Store and enqueue fetch
-    created_docs = 0
     with get_session() as db:
         for it in unique:
             print(f"[DEBUG] Inserting Source for job {job_id}: {it.url}", flush=True)
@@ -160,13 +123,9 @@ def run_discovery(job_id: str, req: dict):
             db.flush()  # obtain s.id
             print(f"[DEBUG] Enqueued fetch_source for source_id={s.id}", flush=True)
             fetch_source.delay(job_id, s.id, it.dict())
-            created_docs += 1  # we will try to create a doc for this source
 
     _set_status(job_id, "fetching")
     print(f"[DEBUG] Updating job {job_id} status to 'fetching'", flush=True)
-
-    # Fallback: if no docs get created (robots/errors), try finalization later anyway
-    finalize_job.apply_async((job_id,), countdown=45)
 
 
 # ---------------------------- FETCH ----------------------------
@@ -181,11 +140,9 @@ def fetch_source(job_id: str, source_id: int, item: dict):
     if not robots_allows(url):
         print(f"[DEBUG] Blocking fetch due to robots.txt for job {job_id}: {url}", flush=True)
         with get_session() as db:
-            s = db.get(Source, source_id)
+            s = db.query(Source).get(source_id)
             if s:
                 s.status = "blocked_by_robots"
-        # Maybe no doc will be created; re-check if we should finalize
-        _maybe_trigger_analysis(job_id)
         return
 
     try:
@@ -207,7 +164,7 @@ def fetch_source(job_id: str, source_id: int, item: dict):
         print(f"[DEBUG] fetch_source stored to {file_path} ({ctype})", flush=True)
 
         with get_session() as db:
-            s = db.get(Source, source_id)
+            s = db.query(Source).get(source_id)
             if s:
                 d = Document(
                     job_id=job_id,
@@ -225,10 +182,9 @@ def fetch_source(job_id: str, source_id: int, item: dict):
     except Exception as e:
         print(f"[ERROR] fetch_source failed: {e}\n{traceback.format_exc()}", flush=True)
         with get_session() as db:
-            s = db.get(Source, source_id)
+            s = db.query(Source).get(source_id)
             if s:
                 s.status = "fetch_failed"
-        _maybe_trigger_analysis(job_id)
 
 
 # ---------------------------- NORMALIZE ----------------------------
@@ -236,66 +192,48 @@ def fetch_source(job_id: str, source_id: int, item: dict):
 @celery_app.task
 def normalize(job_id: str, document_id: int):
     print(f"[DEBUG] normalize received job={job_id} doc_id={document_id}", flush=True)
-
-    # Read primitives while session is OPEN
     with get_session() as db:
-        d = db.get(Document, document_id)
-        if not d:
-            print("[WARN] normalize: missing Document", flush=True)
+        d = db.query(Document).get(document_id)
+        s = db.query(Source).get(d.source_id) if d else None
+        if not d or not s:
+            print("[WARN] normalize: missing Document or Source", flush=True)
             return
-        s = db.get(Source, d.source_id)
-        url = s.url if s else None
 
-        # mark progress
-        d.status = "normalizing"
-        db.add(d)
-
-    if not url:
-        print("[WARN] normalize: missing Source/URL", flush=True)
-        _maybe_trigger_analysis(job_id)
-        return
-
-    # Network work OUTSIDE the session
-    ok = False
-    text_out = ""
     try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": "DeepResearchBot"})
-        r.raise_for_status()
+        r = requests.get(s.url, timeout=30, headers={"User-Agent": "DeepResearchBot"})
         ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
 
-        if "html" in ctype or url.lower().endswith((".html", ".htm", "/")):
-            text_out = html_to_text(r.content, url=url)
-        elif "pdf" in ctype or url.lower().endswith(".pdf"):
+        text_out = ""
+        if "html" in ctype or s.url.lower().endswith((".html", ".htm", "/")):
+            text_out = html_to_text(r.content, url=s.url)
+        elif "pdf" in ctype or s.url.lower().endswith(".pdf"):
             tmp = f"/tmp/{document_id}.pdf"
             with open(tmp, "wb") as f:
                 f.write(r.content)
             text_out = pdf_to_text(tmp)
         else:
             text_out = ""
-        ok = True
-    except Exception as e:
-        print(f"[ERROR] normalize failed: {e}\n{traceback.format_exc()}", flush=True)
-        ok = False
 
-    # Save result in a NEW session
-    with get_session() as db:
-        d = db.get(Document, document_id)
-        if d:
-            if ok:
-                text_key = f"jobs/{job_id}/normalized/{document_id}.txt"
-                text_path = put_bytes(text_key, (text_out or "").encode("utf-8"), content_type="text/plain")
+        text_key = f"jobs/{job_id}/normalized/{document_id}.txt"
+        text_path = put_bytes(text_key, (text_out or "").encode("utf-8"), content_type="text/plain")
+        print(f"[DEBUG] normalize wrote {text_path} (len={len(text_out)})", flush=True)
+
+        with get_session() as db:
+            d = db.query(Document).get(document_id)
+            if d:
                 d.text_path = text_path
                 d.status = "normalized"
-            else:
-                d.status = "normalize_failed"
-            db.add(d)
+                db.add(d)
 
-    # Continue
-    if ok:
         print(f"[DEBUG] Enqueue index for doc_id={document_id}", flush=True)
         index.delay(job_id, document_id)
-    else:
-        _maybe_trigger_analysis(job_id)
+
+    except Exception as e:
+        print(f"[ERROR] normalize failed: {e}\n{traceback.format_exc()}", flush=True)
+        with get_session() as db:
+            d = db.query(Document).get(document_id)
+            if d:
+                d.status = "normalize_failed"
 
 
 # ---------------------------- INDEX ----------------------------
@@ -303,71 +241,60 @@ def normalize(job_id: str, document_id: int):
 @celery_app.task
 def index(job_id: str, document_id: int):
     print(f"[DEBUG] index received job={job_id} doc_id={document_id}", flush=True)
-
-    # Read primitives while session is OPEN
     with get_session() as db:
-        d = db.get(Document, document_id)
-        if not d:
-            print("[WARN] index: missing Document", flush=True)
-            return
-        s = db.get(Source, d.source_id)
-        j = db.get(Job, job_id)
-        if not s or not j:
-            print("[WARN] index: missing Source/Job", flush=True)
+        d = db.query(Document).get(document_id)
+        s = db.query(Source).get(d.source_id) if d else None
+        job = db.query(Job).get(job_id) if d else None
+        if not d or not s or not job:
+            print("[WARN] index: missing Document/Source/Job", flush=True)
             return
 
-        url = s.url
-        published_at = s.published_at
-        kind = s.kind
-        person = j.person
-
-    # Prepare text outside session (re-fetch for simplicity)
-    ok = True
-    text = ""
     try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": "DeepResearchBot"})
-        r.raise_for_status()
+        r = requests.get(s.url, timeout=30, headers={"User-Agent": "DeepResearchBot"})
         ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
-        if "html" in ctype or url.lower().endswith((".html", ".htm", "/")):
-            text = html_to_text(r.content, url=url)
-        elif "pdf" in ctype or url.lower().endswith(".pdf"):
+        if "html" in ctype or s.url.lower().endswith((".html", ".htm", "/")):
+            text = html_to_text(r.content, url=s.url)
+        elif "pdf" in ctype or s.url.lower().endswith(".pdf"):
             tmp = f"/tmp/{document_id}.pdf"
             with open(tmp, "wb") as f:
                 f.write(r.content)
             text = pdf_to_text(tmp)
         else:
             text = ""
-    except Exception as e:
-        print(f"[ERROR] index fetch failed: {e}\n{traceback.format_exc()}", flush=True)
-        ok = False
 
-    if ok and text and len(text.strip()) >= 200:
+        if not text or len(text.strip()) < 200:
+            print("[DEBUG] index: too little text, skipping embedding", flush=True)
+            return
+
         chunk_size = 1500
         chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
         for ch in chunks:
             vec = embed(ch[:1000])
             payload = {
                 "job_id": job_id,
-                "person": person,
-                "source_url": url,
-                "published_at": published_at,
-                "kind": kind,
+                "person": job.person,
+                "source_url": s.url,
+                "published_at": s.published_at,
+                "kind": s.kind,
                 "text": ch[:1200],
             }
             upsert_chunk(vec, payload)
-    else:
-        print("[DEBUG] index: too little text or fetch failed, skipping embedding", flush=True)
 
-    # Mark doc terminal status
-    with get_session() as db:
-        d = db.get(Document, document_id)
-        if d:
-            d.status = "indexed" if ok and text and len(text.strip()) >= 200 else "index_failed"
-            d.updated_at = datetime.utcnow()
-            db.add(d)
+        with get_session() as db:
+            d = db.query(Document).get(document_id)
+            if d:
+                d.status = "indexed"
+                db.add(d)
 
-    # If no pending docs remain, analyze
-    _maybe_trigger_analysis(job_id)
+        # kick analysis after indexing
+        analyze_timeline.delay(job_id)
+
+    except Exception as e:
+        print(f"[ERROR] index failed: {e}\n{traceback.format_exc()}", flush=True)
+        with get_session() as db:
+            d = db.query(Document).get(document_id)
+            if d:
+                d.status = "index_failed"
 
 
 # ---------------------------- ANALYZE ----------------------------
@@ -376,18 +303,13 @@ def index(job_id: str, document_id: int):
 def analyze_timeline(job_id: str):
     print(f"[DEBUG] analyze_timeline start job={job_id}", flush=True)
     _set_status(job_id, "analyzing")
-
-    # Read person locally
     with get_session() as db:
-        j = db.get(Job, job_id)
-        if not j:
+        job = db.query(Job).get(job_id)
+        if not job:
             print("[WARN] analyze_timeline: missing Job", flush=True)
-            _set_status(job_id, "analysis_failed")
             return
-        person = j.person
-
     try:
-        tl = make_timeline(job_id, person) or []
+        tl = make_timeline(job_id, job.person) or []
         with get_session() as db:
             for e in tl:
                 ev = Event(
@@ -402,39 +324,3 @@ def analyze_timeline(job_id: str):
     except Exception as e:
         print(f"[ERROR] analyze_timeline failed: {e}\n{traceback.format_exc()}", flush=True)
         _set_status(job_id, "analysis_failed")
-
-
-# ---------------------------- FINALIZE (fallback) ----------------------------
-
-@celery_app.task
-def finalize_job(job_id: str):
-    with get_session() as db:
-        job = db.get(Job, job_id)
-        if job and job.status in ("analyzing", "complete", "analysis_failed"):
-            print(f"[DEBUG] finalize_job: job {job_id} already {job.status}, skipping")
-            return
-
-        total = db.query(func.count(Document.id)).filter(Document.job_id == job_id).scalar() or 0
-        pending = db.query(func.count(Document.id)).filter(
-            Document.job_id == job_id,
-            Document.status.notin_(["indexed", "index_failed", "normalize_failed"])
-        ).scalar() or 0
-
-    print(f"[DEBUG] finalize_job job={job_id} total_docs={total} pending_docs={pending}")
-    if total == 0:
-        # try again shortly; maybe every source was blocked and docs haven't materialized
-        finalize_job.apply_async((job_id,), countdown=20)
-        return
-
-    if pending == 0:
-        analyze_timeline.delay(job_id)
-    else:
-        finalize_job.apply_async((job_id,), countdown=20)
-
-#@celery_app.task
-#def finalize_job(job_id: str):
-#    """Fallback: if after some time there are no pending docs, run analysis."""
-#    pending = _pending_docs_count(job_id)
-#    print(f"[DEBUG] finalize_job job={job_id} pending_docs={pending}", flush=True)
-#    if pending == 0:
-#        analyze_timeline.delay(job_id)

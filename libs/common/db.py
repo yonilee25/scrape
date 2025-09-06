@@ -1,6 +1,5 @@
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from contextlib import contextmanager
 import json
@@ -13,10 +12,16 @@ SessionLocal = None
 Base = declarative_base()
 
 def get_engine():
+    """Lazily create engine + SessionLocal once, with expire_on_commit=False."""
     global engine, SessionLocal
     if engine is None:
         engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True, future=True)
-        SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        SessionLocal = sessionmaker(
+            bind=engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,   # <-- important to avoid stale/detached attrs after commit
+        )
     return engine
 
 @contextmanager

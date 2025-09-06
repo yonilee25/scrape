@@ -6,6 +6,7 @@ import os
 import hashlib
 import traceback
 from datetime import datetime
+from urllib.parse import urlsplit                                                   #New
 
 import requests
 from sqlalchemy import func
@@ -26,6 +27,28 @@ SKIP_SITEMAPS = os.getenv("SKIP_SITEMAPS", "1") == "1"
 SKIP_WORDPRESS = os.getenv("SKIP_WORDPRESS", "1") == "1"
 
 settings = Settings()
+
+##########################################################################################   New   ##############################################################
+# Be a polite, identifiable UA
+HEADERS = {"User-Agent": "DeepResearch/0.1 (+contact: you@example.com)"}
+
+# Simple signal controls
+TRUST_DOMAINS = {
+    "en.wikipedia.org", "www.reuters.com", "apnews.com", "www.cnn.com",
+    "www.bbc.com", "www.nytimes.com", "www.wired.com", "www.cnbc.com",
+    "www.theguardian.com", "www.axios.com", "abcnews.go.com", "www.vox.com"
+}
+BLOCK_DOMAINS = {
+    "icon-icons.com", "producthunt.com", "elonmask.co", "truebluemeandyou.com",
+    "madeinatlantis.com", "cybergenica.com", "tuvie.com", "wonderfulengineering.com"
+}
+
+def _domain(url: str) -> str:
+    try:
+        return urlsplit(url).netloc.lower()
+    except Exception:
+        return ""
+##########################################################################################   New   ##############################################################
 
 def _set_status(job_id: str, status: str) -> None:
     """Update job status with a timestamp."""
@@ -51,11 +74,6 @@ def _pending_docs_count(job_id: str) -> int:
             .scalar()
             or 0
         )
-
-#def _maybe_trigger_analysis(job_id: str) -> None:
-#    """If there are no pending docs, kick off analysis."""
-#    if _pending_docs_count(job_id) == 0:
-#        analyze_timeline.delay(job_id)
 
 def _maybe_trigger_analysis(job_id: str) -> None:
     """Run analysis only when we actually have docs and none are pending."""
@@ -373,6 +391,7 @@ def index(job_id: str, document_id: int):
 # ---------------------------- ANALYZE ----------------------------
 
 @celery_app.task
+
 def analyze_timeline(job_id: str):
     print(f"[DEBUG] analyze_timeline start job={job_id}", flush=True)
     _set_status(job_id, "analyzing")
@@ -387,9 +406,28 @@ def analyze_timeline(job_id: str):
         person = j.person
 
     try:
+        # First pass
         tl = make_timeline(job_id, person) or []
+
+        # Optional: if short, try again (e.g., your rag.py can accept k to increase context)
+        if len(tl) < 8:
+            tl = make_timeline(job_id, person) or []
+
+        # --- de-duplicate & save events ---
+        seen, uniq = set(), []
+        for e in (tl or []):
+            date  = (e.get("date")  or "").strip()
+            event = (e.get("event") or "").strip()
+            if not event:
+                continue
+            key = (date, event.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
+
         with get_session() as db:
-            for e in tl:
+            for e in uniq:
                 ev = Event(
                     job_id=job_id,
                     date=e.get("date"),
@@ -397,11 +435,44 @@ def analyze_timeline(job_id: str):
                 )
                 ev.citations = e.get("citations") or []
                 db.add(ev)
+
         _set_status(job_id, "complete")
-        print(f"[DEBUG] analyze_timeline complete job={job_id} events={len(tl)}", flush=True)
+        print(f"[DEBUG] analyze_timeline complete job={job_id} events={len(uniq)}", flush=True)
+
     except Exception as e:
         print(f"[ERROR] analyze_timeline failed: {e}\n{traceback.format_exc()}", flush=True)
         _set_status(job_id, "analysis_failed")
+
+#def analyze_timeline(job_id: str):
+#    print(f"[DEBUG] analyze_timeline start job={job_id}", flush=True)
+#    _set_status(job_id, "analyzing")
+
+#    # Read person locally
+#    with get_session() as db:
+#        j = db.get(Job, job_id)
+#        if not j:
+#            print("[WARN] analyze_timeline: missing Job", flush=True)
+#            _set_status(job_id, "analysis_failed")
+#            return
+#        person = j.person
+
+#    try:
+#        tl = make_timeline(job_id, person) or []
+#        
+#        with get_session() as db:
+#            for e in tl:
+#                ev = Event(
+#                    job_id=job_id,
+#                    date=e.get("date"),
+#                    event_text=e.get("event", ""),
+#                )
+#                ev.citations = e.get("citations") or []
+#                db.add(ev)
+#        _set_status(job_id, "complete")
+#        print(f"[DEBUG] analyze_timeline complete job={job_id} events={len(tl)}", flush=True)
+#    except Exception as e:
+#        print(f"[ERROR] analyze_timeline failed: {e}\n{traceback.format_exc()}", flush=True)
+#        _set_status(job_id, "analysis_failed")
 
 
 # ---------------------------- FINALIZE (fallback) ----------------------------
@@ -430,11 +501,3 @@ def finalize_job(job_id: str):
         analyze_timeline.delay(job_id)
     else:
         finalize_job.apply_async((job_id,), countdown=20)
-
-#@celery_app.task
-#def finalize_job(job_id: str):
-#    """Fallback: if after some time there are no pending docs, run analysis."""
-#    pending = _pending_docs_count(job_id)
-#    print(f"[DEBUG] finalize_job job={job_id} pending_docs={pending}", flush=True)
-#    if pending == 0:
-#        analyze_timeline.delay(job_id)

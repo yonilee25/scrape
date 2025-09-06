@@ -90,7 +90,7 @@ def make_timeline(job_id: str, person: str) -> list[dict]:
     # Retrieve top chunks relevant to "timeline" for this person
     q = f"Key dated events for {person}. Provide event date and description."
     vec = embed(q)
-    hits = search_similar(vec, job_id=job_id, limit=16)
+    hits = search_similar(vec, job_id=job_id, limit=20)
 
     # Build compact context with citations
     ctx_lines = []
@@ -110,9 +110,9 @@ def make_timeline(job_id: str, person: str) -> list[dict]:
     )
     user = (
         "Context:\n" + "\n".join(ctx_lines) +
-        f"\n\nTask: Extract 3–5 key dated events about {person}. "
-        "Every event MUST have a date string and citations using the src URLs. "
-        "Respond with JSON ONLY matching the schema above."
+        f"\n\nTask: Extract 8–12 key dated events about {person}. "
+        "Order chronologically, avoid duplicates, and include citations using the provided src URLs. "
+        "Respond with JSON only."
     )
 
     raw = chat(system, user).strip()

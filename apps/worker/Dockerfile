@@ -1,5 +1,8 @@
 FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
+RUN sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list
+
 # Install Python and pip
 RUN apt-get update && apt-get install -y python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
